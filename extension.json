@@ -1,8 +1,11 @@
 {
   "name": "zot-annotate",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "exec": "go",
-  "args": ["run", "main.go"],
+  "args": [
+    "run",
+    "main.go"
+  ],
   "language": "go",
   "description": "Annotate the latest agent message in a browser and send feedback back to the session",
   "enabled": true
