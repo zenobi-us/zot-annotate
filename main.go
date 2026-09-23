@@ -32,14 +32,17 @@ type config struct {
 }
 
 type app struct {
-	mu       sync.RWMutex
-	writeMu  sync.Mutex
-	latest   string
-	lastURL  string
-	cfg      config
-	dataDir  string
-	server   *http.Server
-	listener net.Listener
+	mu         sync.RWMutex
+	writeMu    sync.Mutex
+	latest     string
+	sessionID  string
+	messageID  string
+	generation uint64
+	lastURL    string
+	cfg        config
+	dataDir    string
+	server     *http.Server
+	listener   net.Listener
 }
 
 type frame struct {
@@ -54,6 +57,9 @@ type frame struct {
 	DataDir      string   `json:"data_dir,omitempty"`
 	Event        string   `json:"event,omitempty"`
 	Events       []string `json:"events,omitempty"`
+	SessionID    string   `json:"session_id,omitempty"`
+	MessageID    string   `json:"latest_assistant_message_id,omitempty"`
+	Snapshot     string   `json:"latest_assistant_message,omitempty"`
 	Description  string   `json:"description,omitempty"`
 	Text         string   `json:"text,omitempty"`
 	Display      string   `json:"display,omitempty"`
@@ -99,7 +105,7 @@ func (a *app) run() error {
 	if err := a.send(enc, frame{Type: "register_command", Name: "annotate", Description: "open a browser editor to annotate the latest agent message"}); err != nil {
 		return err
 	}
-	if err := a.send(enc, frame{Type: "subscribe", Events: []string{"assistant_message"}}); err != nil {
+	if err := a.send(enc, frame{Type: "subscribe", Events: []string{"assistant_message", "session_start", "session_end", "session_snapshot"}}); err != nil {
 		return err
 	}
 	if err := a.send(enc, frame{Type: "ready"}); err != nil {
@@ -112,11 +118,7 @@ func (a *app) run() error {
 		}
 		switch in.Type {
 		case "event":
-			if in.Event == "assistant_message" && strings.TrimSpace(in.Text) != "" {
-				a.mu.Lock()
-				a.latest = in.Text
-				a.mu.Unlock()
-			}
+			a.handleEvent(in)
 		case "command_invoked":
 			if in.Name == "annotate" {
 				a.handleCommand(enc, in.ID)
@@ -127,6 +129,56 @@ func (a *app) run() error {
 		}
 	}
 	return scanner.Err()
+}
+
+func (a *app) handleEvent(in frame) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	switch in.Event {
+	case "session_end":
+		// Historical assistant_message events are not replayed when Zot
+		// switches sessions. Never let the previous session remain annotatable.
+		a.latest = ""
+		a.sessionID = ""
+		a.messageID = ""
+		a.generation++
+
+	case "session_start":
+		a.sessionID = in.SessionID
+		a.latest = ""
+		a.messageID = ""
+		a.generation++
+		// Accept the snapshot fields when newer Zot versions include them on
+		// session_start, while remaining compatible with older hosts.
+		if in.Snapshot != "" {
+			a.latest = in.Snapshot
+			a.messageID = in.MessageID
+		}
+
+	case "session_snapshot":
+		// This is the authoritative state after session/tree navigation.
+		a.sessionID = in.SessionID
+		a.latest = in.Snapshot
+		a.messageID = in.MessageID
+		a.generation++
+
+	case "assistant_message":
+		if in.SessionID != "" && a.sessionID != "" && in.SessionID != a.sessionID {
+			return
+		}
+		if strings.TrimSpace(in.Text) == "" {
+			return
+		}
+		if a.sessionID == "" {
+			a.sessionID = in.SessionID
+		}
+		if a.generation == 0 {
+			a.generation = 1
+		}
+		a.latest = in.Text
+		a.messageID = in.MessageID
+	}
 }
 
 func (a *app) send(enc *json.Encoder, v frame) error {
@@ -214,7 +266,12 @@ func portOf(ln net.Listener) string { return fmt.Sprint(ln.Addr().(*net.TCPAddr)
 func (a *app) state(w http.ResponseWriter, r *http.Request) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	_ = json.NewEncoder(w).Encode(map[string]string{"message": a.latest})
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"message":    a.latest,
+		"session_id": a.sessionID,
+		"message_id": a.messageID,
+		"generation": a.generation,
+	})
 }
 
 func (a *app) upload(w http.ResponseWriter, r *http.Request) {
@@ -264,6 +321,7 @@ func (a *app) submit(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Annotations json.RawMessage `json:"annotations"`
 		Attachments []string        `json:"attachments"`
+		Generation  uint64          `json:"generation"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 2<<20)).Decode(&in); err != nil {
 		http.Error(w, "invalid payload", 400)
@@ -271,7 +329,16 @@ func (a *app) submit(w http.ResponseWriter, r *http.Request) {
 	}
 	a.mu.RLock()
 	message := a.latest
+	generation := a.generation
 	a.mu.RUnlock()
+	if in.Generation == 0 || in.Generation != generation {
+		http.Error(w, "annotation target changed; reopen /annotate for the current session", http.StatusConflict)
+		return
+	}
+	if strings.TrimSpace(message) == "" {
+		http.Error(w, "no assistant message is available to annotate", http.StatusConflict)
+		return
+	}
 	prompt := "Please revise your previous response using this user annotation feedback.\n\nANNOTATED MESSAGE:\n" + message + "\n\nFEEDBACK (JSON):\n" + string(in.Annotations)
 	if len(in.Attachments) > 0 {
 		prompt += "\n\nATTACHED FILES (use the read tool to inspect them):\n- " + strings.Join(in.Attachments, "\n- ")
