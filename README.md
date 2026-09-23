@@ -20,14 +20,39 @@ uses only the Go standard library.
    drop zone. Files are stored in the extension data directory and their local
    paths are included in the follow-up so the agent can inspect them with its
    normal tools.
-6. **Submit once.** The browser posts a structured feedback package. zot-annotate
-   sends a follow-up prompt through the extension protocol, preserving the
-   original message, annotations, and attachment paths. The agent can then
-   produce a revised response in the normal TUI.
+6. **Submit once.** The browser posts each annotation immediately to the
+   extension API. They remain pending until the browser submits them or you
+   run `/annotate collect`. zot-annotate sends a follow-up prompt through the
+   extension protocol, preserving the original message, annotations, and
+   attachment paths. The agent can then produce a revised response in the
+   normal TUI.
+
+The annotation command also supports:
+
+- `/annotate sync` — include new assistant messages produced since the current
+  annotation session started. The browser picks these up automatically.
+- `/annotate collect` — send all annotations currently pending in the session
+  to the agent without closing the browser session.
+- `/annotate cancel` — close the annotation UI and discard all pending
+  annotations.
 
 This first slice deliberately uses a compact feedback package rather than
 trying to mutate the transcript. That keeps session history intact and makes
 annotation requests auditable.
+
+## Screenshots
+
+### Initial launch
+
+![Initial launch](assets/initial-launch.png)
+
+### Annotating a selection
+
+![Annotating a selection](assets/annotating.png)
+
+### Attaching an image
+
+![Attaching an image](assets/attaching-image.png)
 
 ## Install and run
 
@@ -65,6 +90,25 @@ Supported hosts are:
 `ZOT_ANNOTATE_HOST` overrides the file setting for a single run. The port is
 always selected by the operating system, so multiple zot sessions do not need
 hard-coded port assignments.
+
+## Zot theme integration
+
+The annotation UI uses the same terminal-style visual language as zot.sh and
+loads the user's active theme when available. It checks the selected theme
+from Zot's `$ZOT_HOME/config.json` and loads the matching file from
+`$ZOT_HOME/themes/`, including xterm-256 color values and RGB color objects.
+
+For an explicit theme file, set:
+
+```sh
+export ZOT_ANNOTATE_THEME_FILE="$ZOT_HOME/themes/my-theme.json"
+```
+
+The UI maps the theme's `background`, `fg`, `muted`, `accent`, `assistant`,
+`tool`, and `error` colors to local CSS variables. Missing values fall back to
+the built-in cyan/slate palette. This keeps the extension usable with older
+Zot hosts while allowing the web surface to follow the user's current Zot
+colors.
 
 ## Security and lifecycle notes
 

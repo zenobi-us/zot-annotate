@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -31,18 +32,45 @@ type config struct {
 	Host string `json:"host,omitempty"`
 }
 
+type theme struct {
+	Background string
+	Foreground string
+	Muted      string
+	Accent     string
+	Assistant  string
+	Tool       string
+	Error      string
+}
+
+type agentMessage struct {
+	ID   string `json:"id,omitempty"`
+	Text string `json:"text"`
+}
+
+type pendingAnnotation struct {
+	Text        string   `json:"text"`
+	Comment     string   `json:"comment"`
+	Attachments []string `json:"attachments,omitempty"`
+}
+
 type app struct {
-	mu         sync.RWMutex
-	writeMu    sync.Mutex
-	latest     string
-	sessionID  string
-	messageID  string
-	generation uint64
-	lastURL    string
-	cfg        config
-	dataDir    string
-	server     *http.Server
-	listener   net.Listener
+	mu                 sync.RWMutex
+	writeMu            sync.Mutex
+	latest             string
+	sessionID          string
+	messageID          string
+	generation         uint64
+	lastURL            string
+	cfg                config
+	dataDir            string
+	server             *http.Server
+	listener           net.Listener
+	themeStyle         string
+	annotateActive     bool
+	annotateMessages   []agentMessage
+	messageHistory     []agentMessage
+	annotateCursor     int
+	pendingAnnotations []pendingAnnotation
 }
 
 type frame struct {
@@ -64,6 +92,7 @@ type frame struct {
 	Text         string   `json:"text,omitempty"`
 	Display      string   `json:"display,omitempty"`
 	Action       string   `json:"action,omitempty"`
+	Args         string   `json:"args,omitempty"`
 	Error        string   `json:"error,omitempty"`
 	Prompt       string   `json:"prompt,omitempty"`
 }
@@ -102,6 +131,7 @@ func (a *app) run() error {
 		a.dataDir = "."
 	}
 	a.cfg = loadConfig(a.dataDir)
+	a.themeStyle = themeCSS(loadTheme(a.dataDir))
 	if err := a.send(enc, frame{Type: "register_command", Name: "annotate", Description: "open a browser editor to annotate the latest agent message"}); err != nil {
 		return err
 	}
@@ -121,7 +151,7 @@ func (a *app) run() error {
 			a.handleEvent(in)
 		case "command_invoked":
 			if in.Name == "annotate" {
-				a.handleCommand(enc, in.ID)
+				a.handleCommand(enc, in.ID, in.Args)
 			}
 		case "shutdown":
 			_ = a.send(enc, frame{Type: "shutdown_ack"})
@@ -143,17 +173,28 @@ func (a *app) handleEvent(in frame) {
 		a.sessionID = ""
 		a.messageID = ""
 		a.generation++
+		a.annotateActive = false
+		a.annotateMessages = nil
+		a.messageHistory = nil
+		a.annotateCursor = 0
+		a.pendingAnnotations = nil
 
 	case "session_start":
 		a.sessionID = in.SessionID
 		a.latest = ""
 		a.messageID = ""
 		a.generation++
+		a.annotateActive = false
+		a.annotateMessages = nil
+		a.messageHistory = nil
+		a.annotateCursor = 0
+		a.pendingAnnotations = nil
 		// Accept the snapshot fields when newer Zot versions include them on
 		// session_start, while remaining compatible with older hosts.
 		if in.Snapshot != "" {
 			a.latest = in.Snapshot
 			a.messageID = in.MessageID
+			a.messageHistory = append(a.messageHistory, agentMessage{ID: in.MessageID, Text: in.Snapshot})
 		}
 
 	case "session_snapshot":
@@ -162,6 +203,14 @@ func (a *app) handleEvent(in frame) {
 		a.latest = in.Snapshot
 		a.messageID = in.MessageID
 		a.generation++
+		a.annotateActive = false
+		a.annotateMessages = nil
+		a.messageHistory = nil
+		a.annotateCursor = 0
+		a.pendingAnnotations = nil
+		if strings.TrimSpace(in.Snapshot) != "" {
+			a.messageHistory = append(a.messageHistory, agentMessage{ID: in.MessageID, Text: in.Snapshot})
+		}
 
 	case "assistant_message":
 		if in.SessionID != "" && a.sessionID != "" && in.SessionID != a.sessionID {
@@ -178,6 +227,7 @@ func (a *app) handleEvent(in frame) {
 		}
 		a.latest = in.Text
 		a.messageID = in.MessageID
+		a.messageHistory = append(a.messageHistory, agentMessage{ID: in.MessageID, Text: in.Text})
 	}
 }
 
@@ -201,14 +251,188 @@ func loadConfig(dir string) config {
 	return c
 }
 
-func (a *app) handleCommand(enc *json.Encoder, id string) {
-	a.mu.RLock()
-	hasMessage := strings.TrimSpace(a.latest) != ""
-	a.mu.RUnlock()
-	if !hasMessage {
+func loadTheme(dataDir string) theme {
+	t := theme{Background: "#080a0d", Foreground: "#dadada", Muted: "#808080", Accent: "#6adaff", Assistant: "#87d7ff", Tool: "#87d787", Error: "#ff5f5f"}
+	paths := []string{}
+	if explicit := os.Getenv("ZOT_ANNOTATE_THEME_FILE"); explicit != "" {
+		paths = append(paths, explicit)
+	}
+	if b, err := os.ReadFile(filepath.Join(dataDir, "config.json")); err == nil {
+		var cfg map[string]any
+		if json.Unmarshal(b, &cfg) == nil {
+			paths = append(paths, themePathFromConfig(cfg)...)
+		}
+	}
+	zotHome := os.Getenv("ZOT_HOME")
+	if zotHome == "" {
+		zotHome = os.Getenv("XDG_STATE_HOME")
+		if zotHome != "" {
+			zotHome = filepath.Join(zotHome, "zot")
+		} else if home, err := os.UserHomeDir(); err == nil {
+			zotHome = filepath.Join(home, ".local", "state", "zot")
+		}
+	}
+	if b, err := os.ReadFile(filepath.Join(zotHome, "config.json")); err == nil {
+		var cfg map[string]any
+		if json.Unmarshal(b, &cfg) == nil {
+			paths = append(paths, themePathFromConfig(cfg)...)
+		}
+	}
+	for _, path := range paths {
+		if loaded, ok := readTheme(path, zotHome); ok {
+			return mergeTheme(t, loaded)
+		}
+	}
+	return t
+}
+
+func themePathFromConfig(cfg map[string]any) []string {
+	var paths []string
+	for _, key := range []string{"theme_file", "theme_path", "color_theme", "theme"} {
+		if value, ok := cfg[key].(string); ok && value != "" && value != "auto" && value != "dark" && value != "light" {
+			paths = append(paths, value)
+		}
+	}
+	return paths
+}
+
+func readTheme(path, zotHome string) (theme, bool) {
+	candidates := []string{path}
+	if !filepath.IsAbs(path) {
+		candidates = append(candidates, filepath.Join(zotHome, "themes", path), filepath.Join(zotHome, "themes", path+".json"))
+	}
+	for _, candidate := range candidates {
+		b, err := os.ReadFile(candidate)
+		if err != nil {
+			continue
+		}
+		var raw map[string]any
+		if json.Unmarshal(b, &raw) != nil {
+			continue
+		}
+		colors, _ := raw["colors"].(map[string]any)
+		if dark, ok := colors["dark"].(map[string]any); ok {
+			colors = dark
+		}
+		return theme{Background: colorValue(colors["background"]), Foreground: colorValue(colors["fg"]), Muted: colorValue(colors["muted"]), Accent: colorValue(colors["accent"]), Assistant: colorValue(colors["assistant"]), Tool: colorValue(colors["tool"]), Error: colorValue(colors["error"])}, true
+	}
+	return theme{}, false
+}
+
+func mergeTheme(base, override theme) theme {
+	if override.Background != "" {
+		base.Background = override.Background
+	}
+	if override.Foreground != "" {
+		base.Foreground = override.Foreground
+	}
+	if override.Muted != "" {
+		base.Muted = override.Muted
+	}
+	if override.Accent != "" {
+		base.Accent = override.Accent
+	}
+	if override.Assistant != "" {
+		base.Assistant = override.Assistant
+	}
+	if override.Tool != "" {
+		base.Tool = override.Tool
+	}
+	if override.Error != "" {
+		base.Error = override.Error
+	}
+	return base
+}
+
+func colorValue(value any) string {
+	switch v := value.(type) {
+	case string:
+		if strings.HasPrefix(v, "#") {
+			return v
+		}
+	case float64:
+		return xtermColor(int(v))
+	case map[string]any:
+		r, rok := v["r"].(float64)
+		g, gok := v["g"].(float64)
+		b, bok := v["b"].(float64)
+		if rok && gok && bok {
+			return fmt.Sprintf("#%02x%02x%02x", int(r), int(g), int(b))
+		}
+	}
+	return ""
+}
+
+func xtermColor(index int) string {
+	if index < 0 || index > 255 {
+		return ""
+	}
+	if index < 16 {
+		palette := []string{"#000000", "#800000", "#008000", "#808000", "#000080", "#800080", "#008080", "#c0c0c0", "#808080", "#ff0000", "#00ff00", "#ffff00", "#0000ff", "#ff00ff", "#00ffff", "#ffffff"}
+		return palette[index]
+	}
+	if index >= 232 {
+		value := 8 + (index-232)*10
+		return fmt.Sprintf("#%02x%02x%02x", value, value, value)
+	}
+	levels := []int{0, 95, 135, 175, 215, 255}
+	n := index - 16
+	return fmt.Sprintf("#%02x%02x%02x", levels[n/36], levels[(n/6)%6], levels[n%6])
+}
+
+func themeCSS(t theme) string {
+	return fmt.Sprintf(":root{--zot-theme-bg:%s;--zot-theme-fg:%s;--zot-theme-muted:%s;--zot-theme-accent:%s;--zot-theme-assistant:%s;--zot-theme-tool:%s;--zot-theme-error:%s}", t.Background, t.Foreground, t.Muted, t.Accent, t.Assistant, t.Tool, t.Error)
+}
+
+func (a *app) syncAnnotations() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !a.annotateActive {
+		return false
+	}
+	a.annotateMessages = append(a.annotateMessages, a.messageHistory[a.annotateCursor:]...)
+	a.annotateCursor = len(a.messageHistory)
+	return true
+}
+
+func (a *app) handleCommand(enc *json.Encoder, id string, args string) {
+	subcommand := ""
+	if fields := strings.Fields(strings.TrimSpace(args)); len(fields) > 0 {
+		subcommand = strings.ToLower(fields[0])
+	}
+	switch subcommand {
+	case "cancel":
+		a.cancelAnnotations()
+		_ = a.send(enc, frame{Type: "command_response", ID: id, Action: "display", Display: "Annotation session cancelled; pending annotations discarded."})
+		return
+	case "collect":
+		if err := a.collectAnnotations(); err != nil {
+			_ = a.send(enc, frame{Type: "command_response", ID: id, Action: "display", Display: "Could not collect annotations: " + err.Error()})
+			return
+		}
+		_ = a.send(enc, frame{Type: "command_response", ID: id, Action: "display", Display: "Collected pending annotations and sent them to the current session."})
+		return
+	case "sync":
+		active := a.syncAnnotations()
+		if !active {
+			_ = a.send(enc, frame{Type: "command_response", ID: id, Action: "display", Display: "No annotation session is active. Run /annotate first."})
+			return
+		}
+		_ = a.send(enc, frame{Type: "command_response", ID: id, Action: "display", Display: "Annotation session synced; new agent messages are available in the browser."})
+		return
+	}
+
+	a.mu.Lock()
+	if strings.TrimSpace(a.latest) == "" {
+		a.mu.Unlock()
 		_ = a.send(enc, frame{Type: "command_response", ID: id, Action: "display", Display: "No assistant message is available to annotate yet."})
 		return
 	}
+	a.annotateActive = true
+	a.annotateMessages = []agentMessage{{ID: a.messageID, Text: a.latest}}
+	a.annotateCursor = len(a.messageHistory)
+	a.pendingAnnotations = nil
+	a.mu.Unlock()
 	if err := a.startServer(); err != nil {
 		_ = a.send(enc, frame{Type: "command_response", ID: id, Action: "display", Display: "Could not start annotation UI: " + err.Error()})
 		return
@@ -217,7 +441,7 @@ func (a *app) handleCommand(enc *json.Encoder, id string) {
 	url := a.lastURL
 	a.mu.RUnlock()
 	openBrowser(url)
-	_ = a.send(enc, frame{Type: "command_response", ID: id, Action: "display", Display: "Annotation UI opened in your browser. Submit it there to send feedback to this session."})
+	_ = a.send(enc, frame{Type: "command_response", ID: id, Action: "display", Display: "Annotation UI opened in your browser. Use /annotate sync, /annotate collect, or /annotate cancel as needed."})
 }
 
 func (a *app) startServer() error {
@@ -240,9 +464,10 @@ func (a *app) startServer() error {
 		a.mu.RLock()
 		msg := a.latest
 		a.mu.RUnlock()
-		_ = tmpl.Execute(w, map[string]string{"Message": msg})
+		_ = tmpl.Execute(w, map[string]any{"Message": msg, "ThemeStyle": template.CSS(a.themeStyle)})
 	})
 	mux.HandleFunc("/api/state", a.state)
+	mux.HandleFunc("/api/annotations", a.annotations)
 	mux.HandleFunc("/api/upload", a.upload)
 	mux.HandleFunc("/api/submit", a.submit)
 	a.listener, a.server = ln, &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
@@ -267,11 +492,57 @@ func (a *app) state(w http.ResponseWriter, r *http.Request) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"message":    a.latest,
-		"session_id": a.sessionID,
-		"message_id": a.messageID,
-		"generation": a.generation,
+		"message":       a.latest,
+		"messages":      a.annotateMessages,
+		"session_id":    a.sessionID,
+		"message_id":    a.messageID,
+		"generation":    a.generation,
+		"active":        a.annotateActive,
+		"pending_count": len(a.pendingAnnotations),
 	})
+}
+
+func (a *app) annotations(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		a.mu.RLock()
+		pending := append([]pendingAnnotation(nil), a.pendingAnnotations...)
+		a.mu.RUnlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{"annotations": pending})
+	case http.MethodPost:
+		var in struct {
+			Annotation pendingAnnotation `json:"annotation"`
+			Generation uint64            `json:"generation"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&in); err != nil || strings.TrimSpace(in.Annotation.Text) == "" || strings.TrimSpace(in.Annotation.Comment) == "" {
+			http.Error(w, "invalid annotation", http.StatusBadRequest)
+			return
+		}
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		if !a.annotateActive || in.Generation == 0 || in.Generation != a.generation {
+			http.Error(w, "annotation session changed; reopen /annotate", http.StatusConflict)
+			return
+		}
+		a.pendingAnnotations = append(a.pendingAnnotations, in.Annotation)
+		w.WriteHeader(http.StatusNoContent)
+	case http.MethodDelete:
+		index, err := strconv.Atoi(r.URL.Query().Get("index"))
+		if err != nil {
+			http.Error(w, "invalid annotation index", http.StatusBadRequest)
+			return
+		}
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		if index < 0 || index >= len(a.pendingAnnotations) {
+			http.Error(w, "annotation not found", http.StatusNotFound)
+			return
+		}
+		a.pendingAnnotations = append(a.pendingAnnotations[:index], a.pendingAnnotations[index+1:]...)
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
 }
 
 func (a *app) upload(w http.ResponseWriter, r *http.Request) {
@@ -313,15 +584,58 @@ func saveUpload(h *multipart.FileHeader, dir string) (string, error) {
 	return f.Name(), err
 }
 
+func (a *app) cancelAnnotations() {
+	a.mu.Lock()
+	server := a.server
+	a.server = nil
+	a.listener = nil
+	a.annotateActive = false
+	a.annotateMessages = nil
+	a.pendingAnnotations = nil
+	a.mu.Unlock()
+	if server != nil {
+		_ = server.Close()
+	}
+}
+
+func (a *app) collectAnnotations() error {
+	a.mu.RLock()
+	active := a.annotateActive
+	pending := append([]pendingAnnotation(nil), a.pendingAnnotations...)
+	message := a.latest
+	a.mu.RUnlock()
+	if !active {
+		return fmt.Errorf("no annotation session is active")
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+	if strings.TrimSpace(message) == "" {
+		return fmt.Errorf("no assistant message is available to annotate")
+	}
+	payload, err := json.Marshal(pending)
+	if err != nil {
+		return err
+	}
+	prompt := "Please revise your previous response using the annotation feedback collected so far.\n\nANNOTATED MESSAGE:\n" + message + "\n\nFEEDBACK (JSON):\n" + string(payload)
+	if err := a.submitToSession(prompt); err != nil {
+		return err
+	}
+	a.mu.Lock()
+	a.pendingAnnotations = nil
+	a.mu.Unlock()
+	return nil
+}
+
 func (a *app) submit(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", 405)
 		return
 	}
 	var in struct {
-		Annotations json.RawMessage `json:"annotations"`
-		Attachments []string        `json:"attachments"`
-		Generation  uint64          `json:"generation"`
+		Annotations []pendingAnnotation `json:"annotations"`
+		Attachments []string            `json:"attachments"`
+		Generation  uint64              `json:"generation"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 2<<20)).Decode(&in); err != nil {
 		http.Error(w, "invalid payload", 400)
@@ -330,6 +644,7 @@ func (a *app) submit(w http.ResponseWriter, r *http.Request) {
 	a.mu.RLock()
 	message := a.latest
 	generation := a.generation
+	pending := append([]pendingAnnotation(nil), a.pendingAnnotations...)
 	a.mu.RUnlock()
 	if in.Generation == 0 || in.Generation != generation {
 		http.Error(w, "annotation target changed; reopen /annotate for the current session", http.StatusConflict)
@@ -339,7 +654,15 @@ func (a *app) submit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no assistant message is available to annotate", http.StatusConflict)
 		return
 	}
-	prompt := "Please revise your previous response using this user annotation feedback.\n\nANNOTATED MESSAGE:\n" + message + "\n\nFEEDBACK (JSON):\n" + string(in.Annotations)
+	if len(pending) == 0 {
+		pending = in.Annotations
+	}
+	payload, err := json.Marshal(pending)
+	if err != nil {
+		http.Error(w, "could not encode annotations", http.StatusInternalServerError)
+		return
+	}
+	prompt := "Please revise your previous response using this user annotation feedback.\n\nANNOTATED MESSAGE:\n" + message + "\n\nFEEDBACK (JSON):\n" + string(payload)
 	if len(in.Attachments) > 0 {
 		prompt += "\n\nATTACHED FILES (use the read tool to inspect them):\n- " + strings.Join(in.Attachments, "\n- ")
 	}
@@ -347,6 +670,9 @@ func (a *app) submit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
+	a.mu.Lock()
+	a.pendingAnnotations = nil
+	a.mu.Unlock()
 	w.WriteHeader(http.StatusNoContent)
 }
 

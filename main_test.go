@@ -1,8 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"html/template"
+	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -43,6 +47,51 @@ func TestHandleEventAppliesSessionSnapshot(t *testing.T) {
 
 	if a.latest != "rewound response" || a.sessionID != "session-b" || a.messageID != "entry-7" {
 		t.Fatalf("snapshot not applied: %#v", a)
+	}
+}
+
+func TestThemeStyleIsRenderedAsCSS(t *testing.T) {
+	tmpl, err := template.ParseFS(uiFS, "ui/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var rendered bytes.Buffer
+	style := themeCSS(theme{Background: "#111111", Foreground: "#eeeeee"})
+	if err := tmpl.Execute(&rendered, map[string]any{
+		"Message":    "hello",
+		"ThemeStyle": template.CSS(style),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(rendered.String(), "ZgotmplZ") {
+		t.Fatal("theme CSS was escaped as unsafe template content")
+	}
+	if !strings.Contains(rendered.String(), style) {
+		t.Fatalf("rendered page does not contain theme CSS: %q", style)
+	}
+}
+
+func TestAnnotationAPIStoresPendingFeedback(t *testing.T) {
+	a := &app{annotateActive: true, generation: 4}
+	body := strings.NewReader(`{"generation":4,"annotation":{"text":"old phrase","comment":"replace it"}}`)
+	r := httptest.NewRecorder()
+	a.annotations(r, httptest.NewRequest("POST", "/api/annotations", body))
+	if r.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", r.Code, http.StatusNoContent)
+	}
+	if len(a.pendingAnnotations) != 1 || a.pendingAnnotations[0].Comment != "replace it" {
+		t.Fatalf("pending annotations = %#v", a.pendingAnnotations)
+	}
+}
+
+func TestSyncMessagesAreAddedDuringAnnotationSession(t *testing.T) {
+	a := &app{annotateActive: true, annotateCursor: 0}
+	a.handleEvent(frame{Event: "session_start", SessionID: "session-a"})
+	a.annotateActive = true
+	a.handleEvent(frame{Event: "assistant_message", SessionID: "session-a", MessageID: "m1", Text: "first"})
+	if !a.syncAnnotations() || len(a.annotateMessages) != 1 || a.annotateMessages[0].Text != "first" {
+		t.Fatalf("synced messages = %#v", a.annotateMessages)
 	}
 }
 
